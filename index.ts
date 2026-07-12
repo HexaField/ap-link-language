@@ -15,7 +15,6 @@
 import {
     defineLanguage,
     agentDid,
-    agentCreateSignedExpression,
     hash,
     languageSettings,
     emitPerspectiveDiff,
@@ -24,12 +23,11 @@ import {
 import type { PerspectiveDiff, LinkExpression } from "./src/types.js";
 import { parseSettings } from "./src/settings.js";
 import type { APLanguageSettings } from "./src/settings.js";
-import { diffToActivities, linkContentKey, shouldFederate, linkOriginKey, linkContentHash } from "./src/translate.js";
-import type { LinkOrigin } from "./src/translate.js";
+import { diffNodeToActivity, shouldFederate, linkOriginKey } from "./src/translate.js";
 import * as store from "./src/store.js";
+import * as dag from "./src/dag.js";
 import { deliverToFollowers } from "./src/delivery.js";
 import { syncFromOutbox } from "./src/sync.js";
-import { buildGroupActor } from "./src/activitypub.js";
 import { processInboxSignal } from "./src/inbox.js";
 import { getFollowerInboxes } from "./src/security.js";
 
@@ -103,7 +101,9 @@ const language = defineLanguage({
         initStorage(new DenoStorageAdapter());
         initTransport(new DenoTransport());
         initSigning(new DenoSigningAdapter());
-        store.initStore();
+        // Wire the content-address hash into the store AND the diff-DAG so link
+        // hashes are identical everywhere (required for removal convergence).
+        store.initStore(hash);
 
         myDid = agentDid();
         settings = parseSettings(languageSettings());
@@ -125,75 +125,73 @@ const language = defineLanguage({
     },
 
     // -----------------------------------------------------------------------
-    // perspective-commit
+    // perspective-commit — appends a node to the emulated diff-DAG
     // -----------------------------------------------------------------------
     commit: {
         async commit(diff: PerspectiveDiff) {
-            // 1. Store links locally
-            store.applyDiff(diff);
+            // 1. Determine which additions to federate (skip links that arrived
+            //    via AP to avoid echo loops), and which removals refer to links
+            //    the DAG actually governs.
+            const federationFilter = (linkHash: string): boolean =>
+                shouldFederate(linkHash, (key) => getStorage().get(key));
 
-            // 2. Skip outbound delivery in subscribe-only mode
-            if (settings.syncMode === "subscribe-only") {
-                emitPerspectiveDiff(diff);
-                return "";
-            }
+            const additions = diff.additions.filter((link) =>
+                federationFilter(store.hashLink(link)),
+            );
+            // Removals carry the ORIGINAL link hash — this is the removal fix.
+            const removalHashes = diff.removals.map((link) => store.hashLink(link));
 
-            // 3. Build federation filter using dual-language origin tracking
-            const federationFilter = (linkHash: string): boolean => {
-                return shouldFederate(linkHash, (key) => getStorage().get(key));
-            };
+            // 2. Append ONE diff-DAG node parented on the current heads. Its
+            //    content hash becomes (part of) the new revision. This is the
+            //    authoritative write; the KV cache is derived from it below.
+            const node = dag.commitDiff(additions, removalHashes, myDid);
 
-            // 4. Track origins for new native commits
-            for (const link of diff.additions) {
-                const h = store.hashLink(link);
-                const originKey = linkOriginKey(h);
-                const storage = getStorage();
+            // 3. Track origins so a link that later arrives back over AP is not
+            //    re-federated (dual-language dedup).
+            const storage = getStorage();
+            for (const link of additions) {
+                const originKey = linkOriginKey(store.hashLink(link));
                 const existing = storage.get(originKey);
-                if (existing === "ap") {
-                    // Arrived via AP, now also committed natively — mark as dual
-                    storage.put(originKey, "dual");
-                } else if (!existing) {
-                    storage.put(originKey, "native");
-                }
+                if (existing === "ap") storage.put(originKey, "dual");
+                else if (!existing) storage.put(originKey, "native");
             }
 
-            // 5. Translate to AP activities (with SDNA pattern detection + federation filter)
-            const activities = diffToActivities(diff, {
+            // 4. Rebuild the derived link cache by folding the DAG, then emit
+            //    the ACTUAL materialised delta to local subscribers.
+            const applied = store.rebuildCacheFromDag();
+            emitPerspectiveDiff(applied);
+
+            // 5. In subscribe-only mode we converge locally but never publish.
+            if (settings.syncMode === "subscribe-only") {
+                return dag.currentRevision();
+            }
+
+            // 6. Encode the DAG node as a single diff activity and federate it.
+            //    A no-op diff (nothing to federate) produces no activity.
+            if (additions.length === 0 && removalHashes.length === 0) {
+                return dag.currentRevision();
+            }
+            const activity = diffNodeToActivity(node, {
                 groupActorUrl: GROUP_ACTOR_URL,
                 actorUrl: agentActorUrl(),
-                settings,
-                hashFn: hash,
-                shouldFederate: federationFilter,
+                published: new Date().toISOString(),
             });
 
-            // 6. Deliver to followers (fire-and-forget + signal emission)
             const inboxes = followerInboxes();
-            if (inboxes.length > 0 && activities.length > 0) {
-                for (const activity of activities) {
-                    await deliverToFollowers(
-                        activity,
-                        inboxes,
-                        actorKeyId,
-                        GROUP_ACTOR_URL,
-                    );
-                }
-            } else if (activities.length > 0) {
-                // No known inboxes — still emit signals for the executor
+            if (inboxes.length > 0) {
+                await deliverToFollowers(activity, inboxes, actorKeyId, GROUP_ACTOR_URL);
+            } else {
                 const { emitDeliveryRequest } = await import("./src/delivery.js");
-                for (const activity of activities) {
-                    emitDeliveryRequest(activity, GROUP_ACTOR_URL);
-                }
+                emitDeliveryRequest(activity, GROUP_ACTOR_URL);
             }
 
-            // 7. Emit the perspective diff for local subscribers
-            emitPerspectiveDiff(diff);
-
-            return "";
+            // 7. Return the new revision — a content hash of the DAG head(s).
+            return dag.currentRevision();
         },
     },
 
     // -----------------------------------------------------------------------
-    // perspective-sync
+    // perspective-sync — walks the emulated diff-DAG and folds it
     // -----------------------------------------------------------------------
     sync: {
         async sync() {
@@ -201,7 +199,7 @@ const language = defineLanguage({
             if (settings.syncMode === "publish-only") {
                 return { additions: [], removals: [] };
             }
-            return await syncFromOutbox(GROUP_OUTBOX_URL, neighbourhoodUrl());
+            return await syncFromOutbox(GROUP_OUTBOX_URL, neighbourhoodUrl(), GROUP_ACTOR_URL);
         },
 
         async render() {
@@ -209,6 +207,7 @@ const language = defineLanguage({
         },
 
         async currentRevision() {
+            // A content hash of the diff-DAG head(s) — never an activity id URL.
             return store.getRevision() || "";
         },
     },

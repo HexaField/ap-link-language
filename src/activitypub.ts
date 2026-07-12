@@ -28,6 +28,14 @@ export const AD4M_CONTEXT_ENTRY = {
     "ad4m:proof": "ad4m:proof",
     "ad4m:did": "ad4m:did",
     "ad4m:neighbourhoodUrl": "ad4m:neighbourhoodUrl",
+    // Emulated diff-DAG (Role A). ActivityPub has no native causal DAG, so each
+    // link-diff activity carries an ad4m:Diff tag encoding a content-addressed
+    // DAG node with prev pointers to its parents' content hashes.
+    "ad4m:Diff": { "@type": "@id" },
+    "ad4m:diffId": "ad4m:diffId",
+    "ad4m:prev": "ad4m:prev",
+    "ad4m:additions": "ad4m:additions",
+    "ad4m:removals": "ad4m:removals",
 };
 
 export function apContext(): (string | Record<string, unknown>)[] {
@@ -56,6 +64,23 @@ export interface APLinkTag extends APTag {
     "ad4m:predicate": string;
     "ad4m:target": string;
     "ad4m:proof"?: string;
+}
+
+/**
+ * Diff-DAG node carried inside a link-diff activity's Note as an `ad4m:Diff`
+ * tag. This is how ActivityPub — which has no native causal DAG — emulates one:
+ * the tag encodes a content-addressed DAG node whose `ad4m:prev` points at its
+ * parents' content hashes. `ad4m:removals` carries the ORIGINAL link hashes
+ * being tombstoned (never an `ap://deleted` placeholder).
+ *
+ * The full added link payloads travel in a sibling `ad4m:Link` tag array so a
+ * folder can materialise the link set from the activity alone.
+ */
+export interface APDiffTag extends APTag {
+    type: "ad4m:Diff";
+    "ad4m:diffId": string;
+    "ad4m:prev": string[];
+    "ad4m:removals": string[];
 }
 
 export interface APObject {

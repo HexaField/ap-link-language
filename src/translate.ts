@@ -11,9 +11,156 @@
  */
 
 import type { LinkExpression, PerspectiveDiff } from "./types.js";
-import type { APActivity, APObject, APLinkTag, APTag } from "./activitypub.js";
+import type { APActivity, APObject, APLinkTag, APDiffTag, APTag } from "./activitypub.js";
 import { apContext } from "./activitypub.js";
 import type { APLanguageSettings } from "./settings.js";
+import type { DiffNode } from "./dag.js";
+
+// ---------------------------------------------------------------------------
+// Diff-DAG node ↔ AP activity (Role A — the convergence substrate)
+// ---------------------------------------------------------------------------
+//
+// ActivityPub has no native causal DAG. We emulate one by encoding each
+// diff-DAG node as a `Create{Note}` whose Note carries:
+//   - one `ad4m:Diff` tag: { diffId (content hash), prev[], removals[] }
+//     where `removals` are the ORIGINAL link hashes being tombstoned, and
+//   - one `ad4m:Link` tag per addition (full link payload) so any receiver can
+//     fold the DAG from the activity alone.
+//
+// This is the AD4M-facing source of truth. It replaces the old per-link
+// `Create{Note}` (which had no `prev` and no content-hash id) and the broken
+// `Delete` → `ap://deleted` removal (which could never match the original
+// link hash). Human-facing rendering is a separate Role-B projection below.
+
+/** Prefix under which a diff activity's id is derived from its content hash. */
+function diffActivityId(baseUrl: string, diffId: string): string {
+    return `${baseUrl}/diffs/${diffId}`;
+}
+
+function diffObjectId(baseUrl: string, diffId: string): string {
+    return `${baseUrl}/diffs/${diffId}/note`;
+}
+
+/**
+ * Encode a sealed diff-DAG node as an AP `Create{Note}` activity.
+ *
+ * The activity id is derived from the node's CONTENT HASH (not a random URL),
+ * and the Note carries the full DAG node in tags. Non-AD4M AP servers see an
+ * ordinary Note (with a human-readable summary of the diff); AD4M nodes decode
+ * the `ad4m:Diff` + `ad4m:Link` tags back into the DAG node.
+ */
+export function diffNodeToActivity(
+    node: DiffNode,
+    opts: { groupActorUrl: string; actorUrl: string; published?: string },
+): APActivity {
+    const { groupActorUrl, actorUrl } = opts;
+    const published = opts.published || new Date().toISOString();
+
+    const diffTag: APDiffTag = {
+        type: "ad4m:Diff",
+        "ad4m:diffId": node.id,
+        "ad4m:prev": node.prev,
+        "ad4m:removals": node.removals,
+    };
+
+    const tags: APTag[] = [diffTag];
+    for (const link of node.additions) {
+        tags.push(buildAd4mTag(link));
+    }
+
+    const summary =
+        `<p>ad4m diff <code>${escapeHtml(node.id.slice(0, 12))}</code>: ` +
+        `+${node.additions.length} −${node.removals.length}` +
+        (node.prev.length ? ` (prev ${node.prev.length})` : ` (genesis)`) +
+        `</p>`;
+
+    const noteObject: APObject = {
+        type: "Note",
+        id: diffObjectId(groupActorUrl, node.id),
+        attributedTo: actorUrl,
+        content: summary,
+        published,
+        context: groupActorUrl,
+        tag: tags,
+    };
+
+    return {
+        "@context": apContext(),
+        type: "Create",
+        id: diffActivityId(groupActorUrl, node.id),
+        actor: actorUrl,
+        published,
+        to: [`${groupActorUrl}/followers`],
+        object: noteObject,
+    };
+}
+
+/**
+ * Decode an AP activity back into a diff-DAG node, or null if the activity is
+ * not an ad4m diff activity (i.e. carries no `ad4m:Diff` tag). Additions are
+ * reconstructed from the `ad4m:Link` tags. The decoded node's content hash is
+ * NOT recomputed here — callers verify it against `ad4m:diffId` via
+ * `dag.sealDiff` so a tampered/mismatched activity is rejected.
+ */
+export function activityToDiffNode(activity: APActivity): DiffNode | null {
+    if (activity.type !== "Create") return null;
+    const obj = activity.object;
+    if (typeof obj === "string") return null;
+    const note = obj as APObject;
+    if (!Array.isArray(note.tag)) return null;
+
+    const diffTag = note.tag.find(
+        (t): t is APDiffTag => t.type === "ad4m:Diff",
+    );
+    if (!diffTag) return null;
+
+    const linkTags = note.tag.filter(
+        (t): t is APLinkTag => t.type === "ad4m:Link",
+    );
+    const author = `ap:${activity.actor}`;
+    const additions: LinkExpression[] = linkTags.map((t) =>
+        ad4mTagToLink(t, activity.published || new Date().toISOString(), author),
+    );
+
+    return {
+        id: String(diffTag["ad4m:diffId"] || ""),
+        prev: Array.isArray(diffTag["ad4m:prev"]) ? diffTag["ad4m:prev"].map(String) : [],
+        removals: Array.isArray(diffTag["ad4m:removals"]) ? diffTag["ad4m:removals"].map(String) : [],
+        additions,
+        author,
+    };
+}
+
+/** True if an activity carries a diff-DAG node (has an `ad4m:Diff` tag). */
+export function isDiffActivity(activity: APActivity): boolean {
+    if (activity.type !== "Create") return false;
+    const obj = activity.object;
+    if (typeof obj === "string") return false;
+    const note = obj as APObject;
+    return Array.isArray(note.tag) && note.tag.some((t) => t.type === "ad4m:Diff");
+}
+
+/**
+ * Reconstruct a LinkExpression from an `ad4m:Link` tag. Prefers the author and
+ * timestamp embedded in the tag (set by buildAd4mTag) for a lossless round-trip
+ * so folded link hashes match across replicas; falls back to the activity's
+ * actor/published for tags authored by older encoders.
+ */
+function ad4mTagToLink(tag: APLinkTag, fallbackTs: string, fallbackAuthor: string): LinkExpression {
+    return {
+        author: (tag["ad4m:author"] as string) || fallbackAuthor,
+        timestamp: (tag["ad4m:timestamp"] as string) || fallbackTs,
+        data: {
+            source: tag["ad4m:source"],
+            predicate: tag["ad4m:predicate"],
+            target: tag["ad4m:target"],
+        },
+        proof: {
+            signature: (tag["ad4m:proof"] as string) || "",
+            key: (tag["ad4m:key"] as string) || "",
+        },
+    };
+}
 
 // ---------------------------------------------------------------------------
 // SDNA / Subject Class pattern detection (was sdna.ts)
@@ -125,6 +272,11 @@ function escapeHtml(s: string): string {
 
 /**
  * Build an ad4m:Link tag from a LinkExpression.
+ *
+ * Carries author + timestamp + key in addition to the triple + proof, so the
+ * link round-trips losslessly. The link's content hash (used as the OR-Set
+ * key when folding the diff-DAG) is derived from author+timestamp+triple, so
+ * these MUST survive the AP encoding for removals to converge against adds.
  */
 function buildAd4mTag(link: LinkExpression): APLinkTag {
     const tag: APLinkTag = {
@@ -132,9 +284,14 @@ function buildAd4mTag(link: LinkExpression): APLinkTag {
         "ad4m:source": link.data.source || "",
         "ad4m:predicate": link.data.predicate || "",
         "ad4m:target": link.data.target || "",
+        "ad4m:author": link.author,
+        "ad4m:timestamp": link.timestamp,
     };
     if (link.proof?.signature) {
         tag["ad4m:proof"] = link.proof.signature;
+    }
+    if (link.proof?.key) {
+        tag["ad4m:key"] = link.proof.key;
     }
     return tag;
 }
@@ -485,7 +642,20 @@ export function activityToLink(
 }
 
 /**
- * Translate an AP Delete activity into a removal LinkExpression.
+ * Translate a *genuine, external* AP Delete activity (a Fediverse actor
+ * deleting a Note we mirrored) into a removal LinkExpression.
+ *
+ * The removal reconstructs the SAME `ap://external-note` link that the original
+ * `Create{Note}` produced — source = neighbourhood, predicate =
+ * "ap://external-note", target = the deleted object id — so it removes the link
+ * that actually exists. The old implementation emitted a bogus `ap://deleted`
+ * predicate that could NEVER match the original link, so external deletes never
+ * took effect. That placeholder is gone.
+ *
+ * External AP notes are not content-addressed AD4M links, so this removal is
+ * matched by (source, predicate, target) identity rather than full content
+ * hash — see store.removeExternalLink. AD4M convergence removals do NOT use
+ * this path: they carry the original link hash through the diff-DAG.
  */
 export function deleteActivityToRemoval(
     activity: APActivity,
@@ -504,7 +674,7 @@ export function deleteActivityToRemoval(
         data: {
             source: neighbourhoodUrl,
             target: objectId,
-            predicate: "ap://deleted",
+            predicate: "ap://external-note",
         },
         proof: { signature: "", key: "" },
     };

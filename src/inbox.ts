@@ -19,7 +19,8 @@ import { resolveAuthor } from "./actors.js";
 import { isAllowedToPost, checkRateLimit } from "./security.js";
 import { handleFollow, handleUndo } from "./follow.js";
 import * as store from "./store.js";
-import { inboundActivityToLink, inboundActivityToLinks } from "./translate.js";
+import { inboundActivityToLink, inboundActivityToLinks, isDiffActivity } from "./translate.js";
+import { ingestDiffActivities } from "./sync.js";
 
 // ---------------------------------------------------------------------------
 // Pure inbox types and functions (was inbox.pure.ts)
@@ -33,6 +34,7 @@ export interface InboxSignal {
 
 export type InboxProcessResult =
     | { kind: "link-diff"; diff: PerspectiveDiff }
+    | { kind: "diff-node"; activity: APActivity }
     | { kind: "follow"; activity: APActivity }
     | { kind: "undo"; activity: APActivity }
     | { kind: "accept"; activity: APActivity }
@@ -78,6 +80,11 @@ export function routeInboundActivity(
         case "Delete":
         case "Like":
         case "Announce": {
+            // ad4m diff activities are convergence-substrate nodes, not
+            // human-facing content — route them into the diff-DAG.
+            if (isDiffActivity(activity)) {
+                return { kind: "diff-node", activity };
+            }
             const links = groupActorUrl
                 ? inboundActivityToLinks(activity, neighbourhoodUrl, groupActorUrl)
                 : (() => {
@@ -162,6 +169,26 @@ export async function processInboxSignal(
     const storage = getStorage();
 
     switch (result.kind) {
+        case "diff-node": {
+            // Ingest the diff-DAG node (verifies its content hash), fold the
+            // DAG to rebuild the derived cache, and emit the materialised delta.
+            ingestDiffActivities([result.activity]);
+            const applied = store.rebuildCacheFromDag();
+
+            // Mark folded links as ap-origin so they are not re-federated.
+            for (const link of [...applied.additions, ...applied.removals]) {
+                const originKey = linkOriginKey(store.hashLink(link));
+                const existing = storage.get(originKey);
+                if (existing === "native") storage.put(originKey, "dual");
+                else if (!existing) storage.put(originKey, "ap");
+            }
+
+            if (applied.additions.length > 0 || applied.removals.length > 0) {
+                getRuntime().emitPerspectiveDiff(applied);
+            }
+            break;
+        }
+
         case "link-diff":
             // Store links and emit perspective diff
             store.applyDiff(result.diff);

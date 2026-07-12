@@ -14,6 +14,13 @@
 
 import type { StorageAdapter } from "./adapters.js";
 import { getStorage, getRuntime } from "./adapters.js";
+import {
+    hashLink as dagHashLink,
+    initDag,
+    fold as dagFold,
+    dagTouchedLinkHashes,
+    currentRevision as dagCurrentRevision,
+} from "./dag.js";
 
 import type { LinkExpression, PerspectiveDiff, Perspective } from "./types.js";
 
@@ -25,9 +32,14 @@ let _hashFn: ((data: string) => string) | null = null;
  * Call once during language init() after initStorage() and initRuntime()
  * have been called. Optionally provide a custom hash function
  * (defaults to runtime adapter's hash).
+ *
+ * The same hash function is wired into the diff-DAG module so that link
+ * content hashes are IDENTICAL between the KV cache and the DAG — this is what
+ * lets a removal (which carries an original link hash) match its add.
  */
 export function initStore(hashFn?: (data: string) => string): void {
     _hashFn = hashFn ?? null;
+    initDag(hashFn);
 }
 
 function getHashFn(): (data: string) => string {
@@ -65,16 +77,14 @@ function peerKey(did: string): string {
 
 /**
  * Compute a deterministic hash for a LinkExpression.
+ *
+ * Delegates to the diff-DAG's `hashLink` so there is exactly ONE definition of
+ * a link's content hash across the whole language. The KV cache and the DAG
+ * OR-Set therefore agree on element identity, which is required for removals
+ * (carrying the original link hash) to converge against their adds.
  */
 export function hashLink(link: LinkExpression): string {
-    const content = JSON.stringify({
-        source: link.data.source,
-        predicate: link.data.predicate,
-        target: link.data.target,
-        author: link.author,
-        timestamp: link.timestamp,
-    });
-    return getHashFn()(content);
+    return dagHashLink(link);
 }
 
 /**
@@ -123,7 +133,39 @@ export function getLink(linkHash: string): LinkExpression | null {
 }
 
 /**
- * Apply a full PerspectiveDiff to the store.
+ * Remove *external* (non-DAG) links matching a (source, predicate, target)
+ * triple, ignoring author/timestamp.
+ *
+ * Genuine Fediverse Deletes come from a different actor at a different time
+ * than the original Note, so they cannot reconstruct the original link's exact
+ * content hash. External AP notes are not content-addressed AD4M links, so we
+ * match them by triple identity. Returns the links that were removed.
+ *
+ * This is ONLY for the external Role-B projection. AD4M convergence removals
+ * carry the original link hash and flow through the diff-DAG, never here.
+ */
+export function removeExternalLink(match: { source?: string; predicate?: string; target?: string }): LinkExpression[] {
+    const removed: LinkExpression[] = [];
+    for (const key of getStorage().listKeys("links/")) {
+        const raw = getStorage().get(key);
+        if (!raw) continue;
+        const link = JSON.parse(raw) as LinkExpression;
+        if (match.source !== undefined && (link.data.source || "") !== match.source) continue;
+        if (match.predicate !== undefined && (link.data.predicate || "") !== match.predicate) continue;
+        if (match.target !== undefined && (link.data.target || "") !== match.target) continue;
+        removeLink(link);
+        removed.push(link);
+    }
+    return removed;
+}
+
+/**
+ * Apply a full PerspectiveDiff to the store cache.
+ *
+ * This mutates the derived link cache directly. It is used for the Role-B
+ * projection of *external* AP activity (Notes/Likes/Deletes from non-AD4M
+ * Fediverse actors, which are not diff-DAG nodes). AD4M convergence links flow
+ * through the diff-DAG and are materialised via {@link rebuildCacheFromDag}.
  */
 export function applyDiff(diff: PerspectiveDiff): void {
     for (const addition of diff.additions) {
@@ -132,6 +174,58 @@ export function applyDiff(diff: PerspectiveDiff): void {
     for (const removal of diff.removals) {
         removeLink(removal);
     }
+}
+
+/**
+ * Rebuild the KV link cache by folding the authoritative diff-DAG.
+ *
+ * The DAG is the source of truth; the KV store is a derived cache. This clears
+ * every DAG-sourced link key and re-inserts the folded OR-Set result, then
+ * returns the PerspectiveDiff (additions gained / removals lost) relative to
+ * the cache's prior contents so the caller can emit it to subscribers.
+ *
+ * External (non-DAG) links written via {@link applyDiff} are preserved: they
+ * live under the same `links/` prefix but are re-asserted here from a snapshot
+ * of any links whose hash is not produced by the fold. In practice external AP
+ * links and DAG links share the store; to keep the fold authoritative for DAG
+ * content while not dropping external content, we diff by hash set.
+ */
+export function rebuildCacheFromDag(): PerspectiveDiff {
+    const { links: folded } = dagFold();
+
+    // Snapshot current cache hashes.
+    const before = new Map<string, LinkExpression>();
+    for (const key of getStorage().listKeys("links/")) {
+        const raw = getStorage().get(key);
+        if (!raw) continue;
+        const link = JSON.parse(raw) as LinkExpression;
+        before.set(hashLink(link), link);
+    }
+
+    // DAG-derived hashes (authoritative for anything the DAG ever mentioned).
+    const dagTouched = dagTouchedLinkHashes();
+
+    const additions: LinkExpression[] = [];
+    const removals: LinkExpression[] = [];
+
+    // Insert / keep folded links; record newly-appeared ones as additions.
+    for (const [h, link] of folded) {
+        if (!before.has(h)) {
+            putLink(link);
+            additions.push(link);
+        }
+    }
+
+    // Remove links the DAG once had but has now tombstoned; leave purely
+    // external links (never touched by the DAG) untouched.
+    for (const [h, link] of before) {
+        if (dagTouched.has(h) && !folded.has(h)) {
+            removeLink(link);
+            removals.push(link);
+        }
+    }
+
+    return { additions, removals };
 }
 
 // ---------------------------------------------------------------------------
@@ -221,15 +315,15 @@ export function allLinks(): Perspective {
 // ---------------------------------------------------------------------------
 // Revision tracking
 // ---------------------------------------------------------------------------
-
-const REVISION_KEY = "revision";
+//
+// The revision is a CONTENT HASH of the diff-DAG head(s) — never an AP activity
+// id URL, ETag, or timestamp cursor. It is computed on demand by folding the
+// DAG's frontier, so it is deterministic for a given DAG state and stable
+// across restarts. There is no stored, mutable "revision" cursor anymore.
 
 export function getRevision(): string | null {
-    return getStorage().get(REVISION_KEY);
-}
-
-export function setRevision(rev: string): void {
-    getStorage().put(REVISION_KEY, rev);
+    const rev = dagCurrentRevision();
+    return rev === "" ? null : rev;
 }
 
 // ---------------------------------------------------------------------------
