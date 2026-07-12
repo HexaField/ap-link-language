@@ -32,6 +32,7 @@ import { initRuntime } from "../src/adapters.js";
 
 // Production modules under test
 import * as store from "../src/store.js";
+import * as dag from "../src/dag.js";
 import { signedHeaders, computeDigest, buildSigningString, signRequest } from "../src/http-signatures.js";
 import { deliverToInbox, deliverToFollowers } from "../src/delivery.js";
 import { fetchCollectionPage, fetchOutboxMeta, syncFromOutbox, processInboundActivities } from "../src/sync.js";
@@ -363,10 +364,26 @@ describe("Cross-runtime: Store operations", () => {
         assert.equal(all.links.length, 2);
     });
 
-    it("manages revision tracking", () => {
+    it("revision is a content hash of the diff-DAG head(s), not a cursor", () => {
+        // Empty DAG → no revision.
         assert.equal(store.getRevision(), null);
-        store.setRevision("page-42");
-        assert.equal(store.getRevision(), "page-42");
+
+        // Committing a diff-DAG node makes the revision a content hash of the
+        // head. There is no mutable "revision cursor" to set anymore — the old
+        // store.setRevision(pageUrl) is gone; a revision is DERIVED from the DAG.
+        const node = dag.commitDiff(
+            [makeLinkExpression({ data: { source: "s", target: "t", predicate: "p" } })],
+            [],
+            "did:key:zRevTest",
+        );
+        const rev = store.getRevision();
+        assert.ok(rev, "revision must be non-null once the DAG has a head");
+        assert.equal(rev, node.id, "single-head revision equals that head's content hash");
+
+        // Deterministic + stable: recomputing from the same DAG state yields the
+        // identical hash (no timestamp/nonce leakage).
+        assert.equal(store.getRevision(), rev);
+        assert.equal(dag.currentRevision(), rev);
     });
 
     it("manages AP objects cache", () => {
@@ -546,10 +563,14 @@ describe("Cross-runtime: Outbox sync", () => {
         const allLinks = store.allLinks();
         assert.equal(allLinks.links.length, 2);
 
-        // Verify revision was updated
-        const rev = store.getRevision();
-        assert.ok(rev);
-        assert.ok(rev!.includes("note-b"));
+        // External (non-ad4m) Notes are the Role-B projection: they are bridged
+        // into the link cache but are NOT convergence-substrate diff nodes, so
+        // they do NOT advance the revision. The revision is a content hash of
+        // the diff-DAG head(s); with no ad4m diff activities in this outbox the
+        // DAG is empty and the revision is null. (The old code used the last
+        // activity id as an opaque cursor — e.g. contained "note-b" — which is
+        // exactly the fiction this rework removes.)
+        assert.equal(store.getRevision(), null);
     });
 
     it("handles paginated outbox", async () => {
@@ -612,8 +633,12 @@ describe("Cross-runtime: Outbox sync", () => {
         assert.equal(store.allLinks().links.length, 3);
     });
 
-    it("skips already-processed activities using revision", async () => {
-        // First sync
+    it("re-syncing the same outbox is idempotent (derived-cache delta, not a cursor)", async () => {
+        // Idempotency no longer comes from an opaque "already-processed" cursor;
+        // it falls out of the derived cache. A second fold/projection of the
+        // same activities produces NO new additions because the links are
+        // already materialised. This is the honest replacement for the old
+        // revision-cursor dedup.
         const activities: APActivity[] = [
             makeAPCreateNote("rev-a", "https://remote.example.com/users/alice", "Old"),
             makeAPCreateNote("rev-b", "https://remote.example.com/users/alice", "New"),
@@ -633,14 +658,16 @@ describe("Cross-runtime: Outbox sync", () => {
             body: JSON.stringify(collection),
         });
 
-        // First sync: should get both
+        // First sync: both links are new.
         const diff1 = await syncFromOutbox(GROUP_OUTBOX_URL, NEIGHBOURHOOD_URL);
         assert.equal(diff1.additions.length, 2);
 
-        // Second sync: same collection, no new items
+        // Second sync: same collection, nothing new to announce to subscribers.
         mockTransport._clearRequests();
         const diff2 = await syncFromOutbox(GROUP_OUTBOX_URL, NEIGHBOURHOOD_URL);
         assert.equal(diff2.additions.length, 0);
+        // ...and the store did not grow (no duplicate links).
+        assert.equal(store.allLinks().links.length, 2);
     });
 
     it("handles empty outbox", async () => {
@@ -1126,10 +1153,15 @@ describe("Cross-runtime: Full round-trip", () => {
         assert.equal(activities.length, 1);
         assert.equal(activities[0].type, "Delete");
 
-        // 3. Inbound: translate Delete back to removal link
+        // 3. Inbound: translate Delete back to removal link. The inbound
+        //    removal reconstructs the external-note link (source = neighbourhood,
+        //    predicate = "ap://external-note", target = deleted object id) so it
+        //    can actually cancel a real link. The old "ap://deleted" placeholder
+        //    predicate could never match anything and is gone.
         const removalLink = inboundActivityToLink(activities[0], NEIGHBOURHOOD_URL);
         assert.ok(removalLink);
-        assert.equal(removalLink!.data.predicate, "ap://deleted");
+        assert.equal(removalLink!.data.predicate, "ap://external-note");
+        assert.notEqual(removalLink!.data.predicate, "ap://deleted");
     });
 
     it("full pipeline: commit → deliver → sync → verify equivalence", async () => {

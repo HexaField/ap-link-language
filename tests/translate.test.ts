@@ -365,9 +365,47 @@ describe("deleteActivityToRemoval", () => {
 
         const link = deleteActivityToRemoval(activity, NEIGHBOURHOOD);
         assert.ok(link);
+        // REGRESSION (ap://deleted bug): the removal MUST reconstruct the exact
+        // link the original Create{Note} produced — source = neighbourhood,
+        // predicate = "ap://external-note", target = the deleted object id.
+        // The old code emitted predicate "ap://deleted", a placeholder that
+        // could never match any real link, so external Deletes never took
+        // effect. Assert the removal is triple-identical to the original add.
         assert.equal(link!.data.source, NEIGHBOURHOOD);
-        assert.equal(link!.data.predicate, "ap://deleted");
+        assert.equal(link!.data.predicate, "ap://external-note");
         assert.equal(link!.data.target, "https://example.com/objects/1");
+        assert.notEqual(link!.data.predicate, "ap://deleted");
+    });
+
+    it("removal is triple-identical to the add it must cancel", () => {
+        // The Create{Note} → activityToLink and Delete → deleteActivityToRemoval
+        // must yield the SAME (source, predicate, target) so the removal cancels
+        // the add. This is what store.removeExternalLink matches on.
+        const objectId = "https://example.com/objects/round-trip";
+        const create: APActivity = {
+            "@context": ["https://www.w3.org/ns/activitystreams"],
+            type: "Create",
+            id: "https://example.com/activities/create-rt",
+            actor: "https://mastodon.social/users/alice",
+            published: "2026-05-02T01:00:00Z",
+            object: { type: "Note", id: objectId, content: "hello" },
+        };
+        const del: APActivity = {
+            "@context": ["https://www.w3.org/ns/activitystreams"],
+            type: "Delete",
+            id: "https://example.com/activities/del-rt",
+            actor: "https://mastodon.social/users/alice",
+            published: "2026-05-02T02:00:00Z",
+            object: objectId,
+        };
+
+        const add = activityToLink(create, NEIGHBOURHOOD);
+        const removal = deleteActivityToRemoval(del, NEIGHBOURHOOD);
+        assert.ok(add);
+        assert.ok(removal);
+        assert.equal(removal!.data.source, add!.data.source);
+        assert.equal(removal!.data.predicate, add!.data.predicate);
+        assert.equal(removal!.data.target, add!.data.target);
     });
 
     it("handles object as APObject", () => {
@@ -483,7 +521,9 @@ describe("inboundActivityToLink", () => {
         };
         const link = inboundActivityToLink(activity, NEIGHBOURHOOD);
         assert.ok(link);
-        assert.equal(link!.data.predicate, "ap://deleted");
+        // Delete reconstructs the original external-note link (see the
+        // ap://deleted regression above), it is NOT a bogus "deleted" marker.
+        assert.equal(link!.data.predicate, "ap://external-note");
     });
 
     it("routes Like to likeActivityToLink", () => {
@@ -974,7 +1014,7 @@ describe("inboundActivityToLinks", () => {
         };
         const links = inboundActivityToLinks(activity, NEIGHBOURHOOD);
         assert.equal(links.length, 1);
-        assert.equal(links[0].data.predicate, "ap://deleted");
+        assert.equal(links[0].data.predicate, "ap://external-note");
     });
 
     it("handles Like activity", () => {
