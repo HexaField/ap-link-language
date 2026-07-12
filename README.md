@@ -17,15 +17,24 @@ It plays **two distinct roles** at once, and keeps them strictly separated:
   fold that reproduces the link set, and removals that converge. ActivityPub has
   no native causal DAG, so the DAG is **emulated inside the activity stream**
   (see below).
-- **Role B — native projection (best-effort bridge).** Plain Fediverse content —
-  `Create{Note}`, `Like`, `Announce`, real remote `Delete` — is projected into
-  the perspective as ordinary links so AD4M agents can see and interact with
-  Mastodon/Pleroma posts. This projection is lossy and is *never* treated as the
-  source of truth.
+- **Role B — native projection (derived; SHACL-driven).** A **derived**,
+  bidirectional bridge between AD4M subject-class instances and human-facing
+  Fediverse content (an ActivityStreams `Note`):
+  - *outbound* — committed AD4M instances (e.g. Flux chat messages) are
+    **projected** into plain `Create{Note}` activities so Mastodon/Pleroma render
+    them, with **no `ad4m` envelope** attached (the Note is indistinguishable from
+    an ordinary post). This projection is a pure fold of Role A, is lossy, and is
+    **never read back** to rebuild the DAG;
+  - *inbound* — plain Fediverse content (`Note`, `Like`, `Announce`, real remote
+    `Delete`) is surfaced as ordinary links so AD4M agents can see it, and
+    genuinely **native-authored** Notes — from actors that exist *only* on the
+    fediverse (no AD4M DID mapping) — are **ingested as NEW authoritative links**
+    that then enter Role A.
 
 The cardinal error this language avoids is letting the lossy Role-B projection
-stand in for convergence. Role-A links flow through the DAG; Role-B links are a
-separate, clearly-marked overlay.
+stand in for convergence. Role-A links flow through the DAG; Role-B is a derived
+overlay whose only write-back into truth is the ingest of genuinely-native posts
+(which become first-class Role-A links, never a shadow copy).
 
 ## The emulated diff-DAG (Role A)
 
@@ -86,6 +95,58 @@ Two honest removal paths now exist:
 A regression test (`tests/dag.test.ts`) reproduces the old `ap://deleted` shape
 and asserts it fails to cancel a link — locking the bug out.
 
+## Native projection (Role B)
+
+Role B is the derived, human-facing overlay. It is **SHACL-driven**: a subject
+class's shape declares how its instances map to a native ActivityStreams object,
+and the transformer folds a matched instance's links into that object (and back).
+The projection core lives in `src/projection/` and is **protocol-agnostic** —
+byte-identical to the Matrix link language's copy — so every plain-text link
+language shares one transformer. The only AP-specific half is the
+`NativeAdapter` in `src/activitypub-projection.ts`, which knows the AS2 `Note`
+shape.
+
+### SHACL profile → `Note`
+
+A projection profile pairs type flags (which links mark an instance) with field
+mappings (which link's target fills a native property). The default Flux message
+profile — used when no on-graph shape is found — is
+`defaultFluxMessageProfile(AP_NOTE_TYPE, "content")`:
+
+- **flag** `base --flux://entry_type--> flux://has_message` marks the instance;
+- **field** `base --flux://body--> literal:string:<text>` supplies the text,
+  projected into the Note's **`content`** property.
+
+The `content` field is the one required mapping — `toNative` throws if a profile
+omits it. An optional `summary` field maps to the Note's `summary` (content
+warning). No other AD4M state is emitted.
+
+### Outbound — instances → `Create{Note}`
+
+On `commit`, after the Role-A diff node is federated, `projectAndFederate` folds
+the diff's **native-origin** additions (never ap-ingested ones — that would echo
+external content straight back out) through `projectInstances`, and wraps each
+resulting Note in a plain `Create{Note}` via `projectionNoteToActivity`. The
+activity carries **no `ad4m:Diff`/`ad4m:Link` tag and no `ad4m` envelope** — it
+is indistinguishable from an ordinary Fediverse post, so Mastodon/Pleroma render
+it. This projection is a pure fold of Role A, is lossy, and is **never read back**
+to rebuild the DAG. Setting the rendering `strategy` to `"native"` turns Role B
+off in both directions (Role A then carries everything).
+
+### Inbound — genuinely-native `Note`s → authoritative links
+
+On `sync`, alongside the Role-A DAG walk, `ingestNativeNotes` scans outbox
+`Create{Note}` activities and ingests only those authored **natively on the
+fediverse**. Echo suppression skips: our own group actor; any actor that resolves
+to a known AD4M DID (`resolveAuthor` returns a `did:`-prefixed string for mapped
+agents, `ap:<url>` for pure-fediverse ones); activities carrying an `ad4m:Diff`
+tag (those are Role-A substrate, not native content); and note ids already
+ingested. A surviving native Note is reversed via the adapter's `fromNative` into
+its constituent links (base = `ap://note/<note-id>`, author = `attributedTo`,
+timestamp = `published`) and published through `publishDiffRoleA` — so a
+pure-fediverse post becomes a **first-class Role-A link**, entering the diff-DAG
+exactly like a locally-committed one, never a shadow copy.
+
 ## Capabilities
 
 | Capability | Status | Notes |
@@ -114,8 +175,14 @@ and asserts it fails to cancel a link — locking the bug out.
 │    sync.ts    — outbox transport + DAG ingest (re-seal to verify    │
 │                 content hash) + prev-walk + fold + external project. │
 │                                                                     │
-│  Role B — native projection + AP plumbing                           │
+│  Role B — native projection (SHACL) + AP plumbing                   │
+│    projection/  — protocol-agnostic SHACL transformer (shared,      │
+│                   verbatim across link languages): profiles,        │
+│                   projectInstances, ingestNative, literal codec.    │
+│    activitypub-projection.ts — the AP NativeAdapter: Projection ↔   │
+│                   AS2 Note (content field); apNoteBase; no envelope. │
 │    translate.ts — link ↔ AP activity; diffNode ↔ ad4m:Diff activity;│
+│                   projectionNoteToActivity (plain Create{Note});    │
 │                   SDNA pattern detection; dual-language origin      │
 │                   tracking; external-note / Delete translation.     │
 │    inbox.ts     — inbound routing: ad4m diff activities → DAG,      │
@@ -194,6 +261,14 @@ NODE_ENV=development pnpm run test
   delivery, sync, actors, follow, security, HTTP signatures, round-trip);
   proves the core has no hidden `ad4m:host` dependency and that the revision is
   a DAG content hash rather than an outbox cursor.
+- **`tests/projection.test.ts`** — the SHACL projection core plus the AP
+  `NativeAdapter`: literal codec, node-expression evaluation, profile parsing,
+  instance collection/projection, native ingest, and the `Note` round-trip
+  (asserting `toNative` emits ONLY AS2 fields — no `ad4m` envelope or tags).
+- **`tests/channel-b-bridge.test.ts`** — the Role-B orchestration glue over the
+  AP adapter: `toAuthoredLink`, `projectInstances` (graph → clean `Note`),
+  `ingestNative` (`Note` → authoritative links, with container parenting), and
+  the `defaultFluxMessageProfile` fallback.
 - **`tests/actors.test.ts`**, **`tests/follow.test.ts`**, **`tests/inbox.test.ts`**,
   **`tests/security.test.ts`**, **`tests/sdna.test.ts`**,
   **`tests/dual-language.test.ts`** — actor resolution/DID extraction,

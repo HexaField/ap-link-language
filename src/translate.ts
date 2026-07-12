@@ -95,6 +95,71 @@ export function diffNodeToActivity(
     };
 }
 
+// ---------------------------------------------------------------------------
+// Role-B projection Note → Create{Note} activity (native, no ad4m envelope)
+// ---------------------------------------------------------------------------
+//
+// The Channel-B adapter (activitypub-projection.ts) produces a bare AS2 `Note`
+// carrying ONLY native fields (content, optional summary). To federate it we
+// wrap it in a `Create` activity — the same envelope an ordinary Fediverse post
+// uses — stamping the object id, attributedTo, published, and addressing.
+//
+// This deliberately does NOT attach any `ad4m:Diff`/`ad4m:Link` tag: a projected
+// Note is derived, human-facing content, NOT a convergence-substrate node. The
+// authoritative link DAG travels separately via diffNodeToActivity. Because the
+// wrapped Note has no ad4m:Diff tag, isDiffActivity() is false for it and the
+// inbound path treats it as external content (and, for pure-Fediverse authors,
+// ingests it as new authoritative links — see index.ts ingestNativeNotes).
+
+/** Object id for a Role-B projected Note, derived from the instance base URI. */
+function projectionObjectId(groupActorUrl: string, base: string): string {
+    return `${groupActorUrl}/objects/${encodeURIComponent(base)}`;
+}
+
+/** Activity id for a Role-B projected Note's Create, derived from the base URI. */
+function projectionActivityId(groupActorUrl: string, base: string): string {
+    return `${groupActorUrl}/activities/${encodeURIComponent(base)}`;
+}
+
+/**
+ * Wrap a Role-B projected `Note` (bare AS2 object from the Channel-B adapter)
+ * into a deliverable `Create{Note}` activity.
+ *
+ * @param note   The native Note produced by the AP projection adapter. Its
+ *               `content` (and optional `summary`) are the only human-facing
+ *               fields; any `id`/`attributedTo`/`published` it carries are
+ *               overwritten here with the canonical group-scoped values.
+ * @param opts   Envelope inputs: the group base URL, the committing agent's
+ *               actor URL, the subject base URI (for a stable content id), and
+ *               the publish timestamp.
+ */
+export function projectionNoteToActivity(
+    note: APObject,
+    opts: { groupActorUrl: string; actorUrl: string; base: string; published?: string },
+): APActivity {
+    const { groupActorUrl, actorUrl, base } = opts;
+    const published = opts.published || new Date().toISOString();
+
+    const noteObject: APObject = {
+        ...note,
+        type: note.type || "Note",
+        id: projectionObjectId(groupActorUrl, base),
+        attributedTo: actorUrl,
+        published,
+        context: groupActorUrl,
+    };
+
+    return {
+        "@context": apContext(),
+        type: "Create",
+        id: projectionActivityId(groupActorUrl, base),
+        actor: actorUrl,
+        published,
+        to: [`${groupActorUrl}/followers`],
+        object: noteObject,
+    };
+}
+
 /**
  * Decode an AP activity back into a diff-DAG node, or null if the activity is
  * not an ad4m diff activity (i.e. carries no `ad4m:Diff` tag). Additions are

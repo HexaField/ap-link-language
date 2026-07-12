@@ -23,13 +23,31 @@ import {
 import type { PerspectiveDiff, LinkExpression } from "./src/types.js";
 import { parseSettings } from "./src/settings.js";
 import type { APLanguageSettings } from "./src/settings.js";
-import { diffNodeToActivity, shouldFederate, linkOriginKey } from "./src/translate.js";
+import {
+    diffNodeToActivity,
+    projectionNoteToActivity,
+    shouldFederate,
+    linkOriginKey,
+} from "./src/translate.js";
 import * as store from "./src/store.js";
 import * as dag from "./src/dag.js";
-import { deliverToFollowers } from "./src/delivery.js";
-import { syncFromOutbox } from "./src/sync.js";
+import { deliverToFollowers, emitDeliveryRequest } from "./src/delivery.js";
+import { syncFromOutbox, collectOutboxActivities } from "./src/sync.js";
 import { processInboxSignal } from "./src/inbox.js";
 import { getFollowerInboxes } from "./src/security.js";
+import { resolveAuthor } from "./src/actors.js";
+import type { APActivity, APObject } from "./src/activitypub.js";
+
+// Channel-B (Role B) projection — SHACL-driven native ⇄ graph transform.
+import { makeActivityPubAdapter, apNoteBase, AP_NOTE_TYPE } from "./src/activitypub-projection.js";
+import {
+    parseProfiles,
+    projectInstances,
+    ingestNative,
+    toAuthoredLink,
+    defaultFluxMessageProfile,
+    type ProjectionProfile,
+} from "./src/projection/index.js";
 
 // Adapter imports
 import { initTransport, initStorage, getStorage, initSigning, initRuntime } from "./src/adapters.js";
@@ -85,6 +103,205 @@ function followerInboxes(): string[] {
     return getFollowerInboxes();
 }
 
+/**
+ * Deliver one already-built AP activity to followers, falling back to a
+ * federation-service signal when we have no cached follower inboxes yet.
+ */
+async function federateActivity(activity: APActivity): Promise<void> {
+    const inboxes = followerInboxes();
+    if (inboxes.length > 0) {
+        await deliverToFollowers(activity, inboxes, actorKeyId, GROUP_ACTOR_URL);
+    } else {
+        emitDeliveryRequest(activity, GROUP_ACTOR_URL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel-B (Role B) projection wiring
+//
+// The AP adapter maps a generic Projection ⇄ a real ActivityStreams `Note`
+// (wrapped in a Create for delivery, exactly like a Fediverse post). Which
+// graph property fills the Note's `content` is decided by the SHACL projection
+// profile — parsed from any projection://-annotated shapes in the perspective,
+// falling back to the built-in Flux message profile (content field "content")
+// so stock Flux projects without SDNA annotations. No app data is smuggled into
+// the Note; the projection is derived from Role A and NEVER read back as truth
+// (native-authored content is ingested through ingestNative → Channel A only).
+// ---------------------------------------------------------------------------
+
+/** The single Channel-B adapter (AS2 Note ⇄ Projection). */
+const apAdapter = makeActivityPubAdapter();
+const adapterFor = (): ReturnType<typeof makeActivityPubAdapter> => apAdapter;
+
+/** Cached projection profiles; invalidated whenever SHACL shape links change. */
+let cachedProfiles: ProjectionProfile[] | null = null;
+
+/** Native Note ids already ingested into Channel A (echo/dup suppression). */
+const ingestedIds: Set<string> = new Set();
+
+function projectionProfiles(): ProjectionProfile[] {
+    if (cachedProfiles) return cachedProfiles;
+    const shapeLinks = store.allLinks().links.map((l) => ({
+        source: l.data.source ?? "",
+        predicate: l.data.predicate ?? "",
+        target: l.data.target ?? "",
+    }));
+    const parsed = parseProfiles(shapeLinks);
+    // Guarantee a profile targeting a Note so Flux always projects.
+    cachedProfiles = parsed.some((p) => p.nativeType === AP_NOTE_TYPE)
+        ? parsed
+        : [...parsed, defaultFluxMessageProfile(AP_NOTE_TYPE, "content")];
+    return cachedProfiles;
+}
+
+/** True if a diff adds/removes any SHACL shape or projection annotation link. */
+function diffTouchesShapes(diff: PerspectiveDiff): boolean {
+    const isShapePred = (p?: string) =>
+        !!p && (p.startsWith("sh://") || p.startsWith("projection://") || p === "rdf://type");
+    return diff.additions.some((l) => isShapePred(l.data.predicate)) ||
+        diff.removals.some((l) => isShapePred(l.data.predicate));
+}
+
+function invalidateProfilesIfShapes(diff: PerspectiveDiff): void {
+    if (diffTouchesShapes(diff)) cachedProfiles = null;
+}
+
+/**
+ * Publish a locally-produced diff on Role A: append a diff-DAG node, keep the
+ * derived caches in step, federate the node as a diff activity (unless
+ * subscribe-only), and emit the materialised delta to the executor. Used for
+ * native content ingested through Channel B, which must become authoritative
+ * links exactly like a local commit — so pure-Fediverse posts converge into the
+ * perspective's DAG rather than living only in the derived cache.
+ */
+async function publishDiffRoleA(diff: PerspectiveDiff): Promise<PerspectiveDiff> {
+    // Append ONE diff-DAG node parented on the current heads. Removals (none for
+    // ingest) would carry original link hashes; ingest only adds.
+    const removalHashes = diff.removals.map((link) => store.hashLink(link));
+    const node = dag.commitDiff(diff.additions, removalHashes, myDid);
+
+    // Mark ingested links as ap-origin so they are not re-federated back out.
+    const storage = getStorage();
+    for (const link of diff.additions) {
+        const originKey = linkOriginKey(store.hashLink(link));
+        const existing = storage.get(originKey);
+        if (existing === "native") storage.put(originKey, "dual");
+        else if (!existing) storage.put(originKey, "ap");
+    }
+
+    // Fold the DAG → rebuild the derived cache; emit + return the actual delta.
+    const applied = store.rebuildCacheFromDag();
+    if (applied.additions.length > 0 || applied.removals.length > 0) {
+        emitPerspectiveDiff(applied);
+    }
+    invalidateProfilesIfShapes(diff);
+
+    // Federate the DAG node (as a diff activity) so peers converge on it too.
+    if (settings.syncMode !== "subscribe-only" &&
+        (diff.additions.length > 0 || removalHashes.length > 0)) {
+        const activity = diffNodeToActivity(node, {
+            groupActorUrl: GROUP_ACTOR_URL,
+            actorUrl: agentActorUrl(),
+            published: new Date().toISOString(),
+        });
+        await federateActivity(activity);
+    }
+
+    return applied;
+}
+
+/**
+ * Role-B outbound — project committed link additions to native Notes and
+ * federate each as a Create{Note}. Derived and lossy: reconstructed from Role A
+ * on every commit, never parsed back into links. No ad4m envelope is attached
+ * (that rides Role A), so a projected Note is indistinguishable from an ordinary
+ * Fediverse post.
+ */
+async function projectAndFederate(diff: PerspectiveDiff): Promise<void> {
+    if (settings.rendering.strategy === "native") return;
+    invalidateProfilesIfShapes(diff);
+
+    const authored = diff.additions.map(toAuthoredLink);
+    const projected = projectInstances(authored, projectionProfiles(), adapterFor);
+    for (const p of projected) {
+        const activity = projectionNoteToActivity(p.native, {
+            groupActorUrl: GROUP_ACTOR_URL,
+            actorUrl: agentActorUrl(),
+            base: p.base,
+            published: p.timestamp,
+        });
+        await federateActivity(activity);
+    }
+}
+
+/**
+ * Role-B inbound — ingest genuinely native-authored Notes (from pure Fediverse
+ * users with no AD4M bridge) into Channel A as new authoritative links.
+ *
+ * Echo suppression, mirroring the Matrix reference:
+ *   - ad4m diff activities are Role-A substrate, not human content — skipped
+ *     (they carry an ad4m:Diff tag, so fromNative would ignore them anyway, but
+ *     we skip them explicitly);
+ *   - our OWN projections are skipped by actor (== this agent's actor URL);
+ *   - OTHER bridges' projections are skipped because their actor resolves to a
+ *     known AD4M DID (resolveAuthor returns a `did:` — their links already
+ *     arrived authoritatively via Role A). Only actors with NO DID mapping
+ *     (resolveAuthor returns `ap:<url>`) are ingested;
+ *   - already-ingested Notes are skipped by object id.
+ *
+ * No ad4m envelope is read; the SHACL projection maps native fields → links.
+ * The resulting links are published on Role A via publishDiffRoleA, so they
+ * enter the authoritative DAG.
+ */
+async function ingestNativeNotes(activities: APActivity[]): Promise<PerspectiveDiff> {
+    if (settings.rendering.strategy === "native") return { additions: [], removals: [] };
+
+    const myActorUrl = agentActorUrl();
+    const additions: LinkExpression[] = [];
+
+    for (const activity of activities) {
+        if (activity.type !== "Create") continue;
+        const obj = activity.object;
+        if (typeof obj === "string") continue;
+        const note = obj as APObject;
+
+        // Role-A substrate node — not human content.
+        if (Array.isArray(note.tag) && note.tag.some((t) => t.type === "ad4m:Diff")) continue;
+        // Our own projection.
+        if (activity.actor === myActorUrl) continue;
+
+        // Only ingest content from actors with NO known AD4M DID mapping.
+        const author = await resolveAuthor(activity.actor);
+        if (author.startsWith("did:")) continue; // another AD4M agent — arrives via Role A
+
+        // Idempotent by native id: never double-ingest the same Note.
+        const noteId = typeof note.id === "string" ? note.id : "";
+        if (!noteId || ingestedIds.has(noteId)) continue;
+
+        const ingested = ingestNative(note, projectionProfiles(), adapterFor);
+        if (!ingested) continue;
+
+        const timestamp = ingested.timestamp
+            ?? activity.published
+            ?? new Date().toISOString();
+
+        for (const link of ingested.links) {
+            additions.push({
+                author,
+                timestamp,
+                data: { source: link.source, target: link.target, predicate: link.predicate },
+                proof: { signature: "", key: "" },
+            });
+        }
+        ingestedIds.add(noteId);
+    }
+
+    if (additions.length > 0) {
+        return await publishDiffRoleA({ additions, removals: [] });
+    }
+    return { additions: [], removals: [] };
+}
+
 // ---------------------------------------------------------------------------
 // Language definition
 // ---------------------------------------------------------------------------
@@ -117,6 +334,8 @@ const language = defineLanguage({
 
     async teardown() {
         myDid = "";
+        cachedProfiles = null;
+        ingestedIds.clear();
         console.log("[ap-link-language] teardown");
     },
 
@@ -166,26 +385,28 @@ const language = defineLanguage({
                 return dag.currentRevision();
             }
 
-            // 6. Encode the DAG node as a single diff activity and federate it.
-            //    A no-op diff (nothing to federate) produces no activity.
-            if (additions.length === 0 && removalHashes.length === 0) {
-                return dag.currentRevision();
-            }
-            const activity = diffNodeToActivity(node, {
-                groupActorUrl: GROUP_ACTOR_URL,
-                actorUrl: agentActorUrl(),
-                published: new Date().toISOString(),
-            });
-
-            const inboxes = followerInboxes();
-            if (inboxes.length > 0) {
-                await deliverToFollowers(activity, inboxes, actorKeyId, GROUP_ACTOR_URL);
-            } else {
-                const { emitDeliveryRequest } = await import("./src/delivery.js");
-                emitDeliveryRequest(activity, GROUP_ACTOR_URL);
+            // 6. Encode the DAG node as a single diff activity and federate it
+            //    (ROLE A — the authoritative convergence substrate). A no-op diff
+            //    (nothing new to federate) produces no activity.
+            if (additions.length > 0 || removalHashes.length > 0) {
+                const activity = diffNodeToActivity(node, {
+                    groupActorUrl: GROUP_ACTOR_URL,
+                    actorUrl: agentActorUrl(),
+                    published: new Date().toISOString(),
+                });
+                await federateActivity(activity);
             }
 
-            // 7. Return the new revision — a content hash of the DAG head(s).
+            // 7. ROLE B — derived native projection (optional, lossy, never
+            //    truth). Render detected Flux messages as human-readable
+            //    Create{Note} activities for Fediverse clients (Mastodon, etc.).
+            //    No ad4m envelope is attached — this projection is reconstructed
+            //    from Role A on sync, never parsed back into links. Only the
+            //    federated (native-origin) additions are projected, so content
+            //    that arrived over AP is not echoed back out as a fresh Note.
+            await projectAndFederate({ additions, removals: diff.removals });
+
+            // 8. Return the new revision — a content hash of the DAG head(s).
             return dag.currentRevision();
         },
     },
@@ -199,7 +420,28 @@ const language = defineLanguage({
             if (settings.syncMode === "publish-only") {
                 return { additions: [], removals: [] };
             }
-            return await syncFromOutbox(GROUP_OUTBOX_URL, neighbourhoodUrl(), GROUP_ACTOR_URL);
+
+            // ROLE A — fold the emulated diff-DAG from the outbox (authoritative)
+            // and project genuine external AP content (plain Notes/Likes/Deletes
+            // from Fediverse users) into the derived cache.
+            const dagDelta = await syncFromOutbox(
+                GROUP_OUTBOX_URL,
+                neighbourhoodUrl(),
+                GROUP_ACTOR_URL,
+            );
+
+            // ROLE B (inbound) — ingest genuinely native-authored Notes (from
+            // pure Fediverse actors with NO AD4M DID) as NEW authoritative links
+            // on Channel A. Bridged agents' content already arrived via the DAG
+            // above and is skipped by DID resolution; our own projections are
+            // skipped by actor. The outbox activities are the transport we scan.
+            const activities = await collectOutboxActivities(GROUP_OUTBOX_URL);
+            const ingestDelta = await ingestNativeNotes(activities);
+
+            return {
+                additions: [...dagDelta.additions, ...ingestDelta.additions],
+                removals: [...dagDelta.removals, ...ingestDelta.removals],
+            };
         },
 
         async render() {

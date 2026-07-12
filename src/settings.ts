@@ -10,8 +10,10 @@
 export interface RenderingSettings {
     /** Rendering strategy: "auto" detects chat predicates, "semantic"
      *  always includes ad4m:Link tags, "chat" renders as plain notes,
-     *  "raw" emits the triple. */
-    strategy: "auto" | "semantic" | "chat" | "raw";
+     *  "raw" emits the triple, "native" turns the Channel-B projection off
+     *  in BOTH directions (no derived Notes are projected out, and inbound
+     *  native Notes are not ingested — Role A carries everything). */
+    strategy: "auto" | "semantic" | "chat" | "raw" | "native";
     /** Predicates that indicate a chat-style message. */
     chatPredicates: string[];
     /** Whether to resolve Expression URIs for Note content. */
