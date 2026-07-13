@@ -305,6 +305,24 @@ the AP actor URL, changing the content hash so every peer node was silently
 rejected on re-seal (the A=10/B=10 partition). Both are regression-guarded
 (`tests/dag.test.ts` §5.5) and documented in `AGENTS.md`.
 
+### Role B — projection is real, but self-delivery to the Fediverse is not
+
+Channel B was tested against a **real GoToSocial instance**, and the honest
+result splits along the two questions:
+
+- **Is the projection real? Yes.** The `Create{Note}` this language emits is
+  standards-valid AS2 — a live GoToSocial server **accepted and rendered it as an
+  ordinary post**. The native object is correct.
+- **Can the language deliver it itself? Not yet.** GTS only accepted the post
+  because the delivery was hand-signed with a compliant **RSA-SHA256** HTTP
+  signature and pointed at a resolvable actor. This language's **own** outbound
+  path cannot yet satisfy a real Fediverse server (see the self-delivery gaps
+  below).
+
+So Channel B is **projection-consumable but self-delivery-blocked**: any
+Fediverse server will render the object, but making *this language* the sender
+requires the signing/serving work listed next.
+
 ### What still needs distinct-instance federation
 
 The C1 model is **co-located** — both executors share one group actor on the same
@@ -316,6 +334,12 @@ only mock-adapter-tested, not run end-to-end against live remote peers:
 - Actor/WebFinger resolution against a real Mastodon/Pleroma/Lemmy instance.
 - Prev-walk **re-fetching** a missing parent activity over the network (co-located,
   every parent already rides in the same outbox pull, so no gap-fill fetch fires).
+- **Role-B self-delivery signing/serving** (verified blocked against live
+  GoToSocial above): replace the djb2 `ad4m-ldk=` body digest with
+  `Digest: SHA-256=<base64>`, sign with **RSA-SHA256** (not Ed25519-`hs2019`),
+  actually **serve** `buildGroupActor` at a dereferenceable URL, and expose
+  WebFinger — the four gaps that stop this language from delivering its own
+  Role-B `Create{Note}` to a real Fediverse server under its own signature.
 
 ## `ad4m:host` import boundary
 
