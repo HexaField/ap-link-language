@@ -37,6 +37,8 @@ import * as dag from "../src/dag.js";
 import * as store from "../src/store.js";
 import type { DiffNode } from "../src/dag.js";
 import type { LinkExpression } from "../src/types.js";
+import { diffNodeToActivity, activityToDiffNode } from "../src/translate.js";
+import type { APObject } from "../src/activitypub.js";
 
 // ---------------------------------------------------------------------------
 // Deterministic test harness — in-memory storage + a stable string hash
@@ -447,5 +449,162 @@ describe("diff-DAG §5.4: merge is order-independent", () => {
         assert.equal(fold1.length, 2);
         assert.ok(fold1.includes(fnv1a(dag.canonicalLink(La))));
         assert.ok(fold1.includes(fnv1a(dag.canonicalLink(Lb))));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// §5.5 — Federation through the REAL AP activity encoding (C1 partition guard)
+// ---------------------------------------------------------------------------
+//
+// §5.3's transport() copies a node's raw bytes and re-seals them, so it never
+// exercises diffNodeToActivity → activityToDiffNode. That blind spot hid the
+// live C1 A=10/B=10 partition: the node-level `author` (part of the content
+// hash) was reconstructed from the AP actor URL on decode instead of being
+// round-tripped, so every peer node re-sealed to a DIFFERENT id and was
+// silently dropped at sync.ingestDiffActivities (`if (resealed.id !== decoded.id)
+// continue`). These tests transport through the ACTUAL AP encoding, with the
+// group/actor URLs DELIBERATELY unrelated to the committing DID, and assert the
+// content hash survives the round-trip.
+
+describe("diff-DAG §5.5: node survives the AP activity round-trip (C1 partition regression)", () => {
+    const GROUP = "https://ap.example/ap/v1/groups/c1-group";
+    // The AP actor URL is intentionally NOT the committing DID — this is the
+    // exact mismatch that produced the C1 partition. `ap:${actor}` must NOT
+    // leak into the node author, or the re-seal id diverges.
+    const ACTOR = "https://ap.example/ap/v1/users/alice";
+
+    /**
+     * Model the real federation transport: encode the sender's sealed node as an
+     * AP Create{Note}, decode it back on the receiver, re-seal from the decoded
+     * content (exactly as sync.ingestDiffActivities does), verify the id, and
+     * putNode. Returns the decoded+resealed node so callers can assert on it.
+     */
+    function transportViaActivity(node: DiffNode, from: MemStorage, to: MemStorage): DiffNode {
+        const raw = from.get(`dag-node/${node.id}`);
+        assert.ok(raw, "sealed node must be persisted on the sender before transport");
+        const sent = JSON.parse(raw) as DiffNode;
+
+        // Sender side: encode to an AP activity with a NON-DID actor URL.
+        const activity = diffNodeToActivity(sent, { groupActorUrl: GROUP, actorUrl: ACTOR });
+
+        // Receiver side: decode, then re-seal from content and verify the id —
+        // the precise check sync.ingestDiffActivities gates ingestion on.
+        const decoded = activityToDiffNode(activity);
+        assert.ok(decoded, "activity must decode back into a diff node");
+        const resealed = dag.sealDiff({
+            prev: decoded.prev,
+            additions: decoded.additions,
+            removals: decoded.removals,
+            author: decoded.author,
+        });
+        assert.equal(
+            resealed.id,
+            sent.id,
+            "node author must round-trip through the AP activity so the re-seal reproduces the content hash",
+        );
+        dag.putNode(resealed);
+        return resealed;
+    }
+
+    it("the committing DID round-trips — decoded node author is the DID, not the AP actor URL", () => {
+        const storage = new MemStorage();
+        useStorage(storage);
+        const L = makeLink({ target: "roundtrip" });
+        const node = dag.commitDiff([L], [], "did:key:zAlice");
+
+        const activity = diffNodeToActivity(node, { groupActorUrl: GROUP, actorUrl: ACTOR });
+        const decoded = activityToDiffNode(activity);
+        assert.ok(decoded);
+        assert.equal(decoded.author, "did:key:zAlice", "author must be the committing DID");
+        assert.notEqual(decoded.author, `ap:${ACTOR}`, "author must NOT be reconstructed from the AP actor URL");
+        assert.equal(decoded.id, node.id, "decoded id equals the original content hash");
+
+        // And the re-seal reproduces the SAME id (the ingest gate passes).
+        const resealed = dag.sealDiff({
+            prev: decoded.prev,
+            additions: decoded.additions,
+            removals: decoded.removals,
+            author: decoded.author,
+        });
+        assert.equal(resealed.id, node.id, "re-seal reproduces the content hash → node is accepted on ingest");
+    });
+
+    it("two replicas converge across the AP encoding: B's fold contains A's links (reproduces C1 add-convergence)", () => {
+        const repA = new MemStorage();
+        const repB = new MemStorage();
+
+        // A commits several links under its DID and federates each via a full
+        // AP activity round-trip to B — the exact C1 add path.
+        useStorage(repA);
+        const links = [
+            makeLink({ target: "m1" }),
+            makeLink({ target: "m2" }),
+            makeLink({ target: "m3" }),
+        ];
+        const nodes = links.map((L) => dag.commitDiff([L], [], "did:key:zAlice"));
+        const hashes = links.map((L) => fnv1a(dag.canonicalLink(L)));
+        for (const h of hashes) assert.ok(dag.fold().links.has(h), "A sees its own link");
+
+        useStorage(repB);
+        for (const node of nodes) transportViaActivity(node, repA, repB);
+
+        // B converges on every link A added — the assertion that FAILED in the
+        // live C1 run (B kept only its own nodes, dropping A's at the id check).
+        const foldB = dag.fold().links;
+        for (const h of hashes) {
+            assert.ok(foldB.has(h), "B's fold contains A's link after the AP round-trip");
+        }
+        assert.equal(foldB.size, links.length, "B's fold is exactly A's link set (no drops, no dupes)");
+
+        // And the revisions match — full convergence, not just link-set overlap.
+        const revB = dag.currentRevision();
+        useStorage(repA);
+        assert.equal(dag.currentRevision(), revB, "both replicas reach the identical revision after federation");
+    });
+
+    it("removal federates through the AP encoding and cancels the add on the peer", () => {
+        const repA = new MemStorage();
+        const repB = new MemStorage();
+
+        const L = makeLink({ target: "to-remove" });
+        const hL = fnv1a(dag.canonicalLink(L));
+
+        useStorage(repA);
+        const addNode = dag.commitDiff([L], [], "did:key:zAlice");
+
+        useStorage(repB);
+        transportViaActivity(addNode, repA, repB);
+        assert.ok(dag.fold().links.has(hL), "B sees L after the add federates");
+
+        // B removes L (removal carries the ORIGINAL hash) and federates back to A
+        // through the AP encoding.
+        const removeNode = dag.commitDiff([], [dag.hashLink(L)], "did:key:zBob");
+        assert.equal(dag.fold().links.has(hL), false, "B no longer sees L");
+
+        useStorage(repA);
+        transportViaActivity(removeNode, repB, repA);
+        assert.equal(dag.fold().links.has(hL), false, "A converges: L is cancelled after ingesting B's removal");
+    });
+
+    it("an activity missing ad4m:author (older encoder) decodes with the actor-URL fallback", () => {
+        // Backward-compatibility: an activity that predates the fix carries no
+        // ad4m:author. It must still decode (author falls back to ap:${actor}),
+        // even though it can no longer re-seal to a DID-based id — that node is
+        // correctly rejected on ingest, which is the safe, lossless-or-drop
+        // behaviour the content-address contract requires.
+        const storage = new MemStorage();
+        useStorage(storage);
+        const L = makeLink({ target: "legacy" });
+        const node = dag.commitDiff([L], [], "did:key:zAlice");
+
+        const activity = diffNodeToActivity(node, { groupActorUrl: GROUP, actorUrl: ACTOR });
+        // Strip ad4m:author from the Diff tag to simulate an older encoder.
+        const noteObj = activity.object as APObject;
+        const diffTag = (noteObj.tag || []).find((t) => t.type === "ad4m:Diff")!;
+        delete (diffTag as Record<string, unknown>)["ad4m:author"];
+
+        const decoded = activityToDiffNode(activity);
+        assert.ok(decoded, "a legacy activity still decodes");
+        assert.equal(decoded.author, `ap:${ACTOR}`, "legacy author falls back to the AP actor URL");
     });
 });

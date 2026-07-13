@@ -76,6 +76,38 @@ revision stability, and the projection (AS2 `Note` payload shape + echo-suppress
 ingest) against in-memory fixtures. **Not** in CI: live inbox delivery to a
 federated server and **live rendering in Mastodon**.
 
+## Live C1 convergence (wind-tunnel) — verified, with two fixes
+
+The AD4M wind-tunnel **C1** scenario runs two co-located executors against a live
+AP group actor (outbox-reflecting shim). **Verified pass:** A=20/B=20 adds in
+~1.05 s, removal converged in ~3.05 s. Topology is **outbox-pull**: each agent
+POSTs its diff activities to the group inbox → the group reflects them into its
+outbox → both agents pull via `syncFromOutbox` and fold the emulated `prev` DAG.
+
+Two defects the hermetic fixtures missed (both now regression-guarded):
+
+1. **The executor discards `sync()`'s return value.** Inbound peer folds become
+   queryable ONLY if pushed through `emitPerspectiveDiff`. After `syncFromOutbox`,
+   `index.ts` emits the combined delta when non-empty. Symptom without it: C1
+   add-freeze (peers fold internally but `queryLinks` never sees them).
+2. **The DAG node `author` MUST round-trip through the `ad4m:Diff` tag.** The node
+   author (committing DID) is part of the content hash (`dag.canonicalDiff`), so a
+   receiver re-seals the decoded node and rejects it if the recomputed id ≠
+   `ad4m:diffId` (`sync.ingestDiffActivities`). The old decoder reconstructed the
+   author from the **AP actor URL** (`ap:${actor}`) instead of carrying the DID —
+   changing the hash so **every peer node was silently dropped** (the A=10/B=10
+   partition). Fix: `diffNodeToActivity` writes `ad4m:author: node.author`;
+   `activityToDiffNode` reads it back (falling back to the actor URL only for
+   pre-fix activities, which correctly fail re-seal). Guard: `tests/dag.test.ts`
+   §5.5 federates two replicas through the real `diffNodeToActivity →
+   activityToDiffNode` encoding with a non-DID actor URL. **The existing
+   `transport()` fixture copies raw node bytes and re-seals with the author
+   intact — it can NEVER catch an encoding-layer author-loss bug. Any new
+   federation-path test must go through the AP activity encoding.**
+
+Link-level additions already round-tripped `ad4m:author`/`ad4m:timestamp` via
+`buildAd4mTag`; the bug was only the node-level author on the `ad4m:Diff` tag.
+
 ## Gotchas
 
 - ActivityPub delivery is HTTP push only — no bidirectional presence channel, so

@@ -61,6 +61,10 @@ export function diffNodeToActivity(
         "ad4m:diffId": node.id,
         "ad4m:prev": node.prev,
         "ad4m:removals": node.removals,
+        // The node author (committing DID) is part of the content hash — carry it
+        // so a receiver re-seals to the SAME id. Reconstructing it from the AP
+        // actor URL would change the hash and drop the node (co-located C1 bug).
+        "ad4m:author": node.author,
     };
 
     const tags: APTag[] = [diffTag];
@@ -182,17 +186,26 @@ export function activityToDiffNode(activity: APActivity): DiffNode | null {
     const linkTags = note.tag.filter(
         (t): t is APLinkTag => t.type === "ad4m:Link",
     );
-    const author = `ap:${activity.actor}`;
+    // Link-level author fallback for tags that omit ad4m:author (older encoders).
+    const linkFallbackAuthor = `ap:${activity.actor}`;
     const additions: LinkExpression[] = linkTags.map((t) =>
-        ad4mTagToLink(t, activity.published || new Date().toISOString(), author),
+        ad4mTagToLink(t, activity.published || new Date().toISOString(), linkFallbackAuthor),
     );
+
+    // The DAG node author is part of the content hash. Prefer the round-tripped
+    // ad4m:author (the committing DID); only fall back to the AP actor URL for
+    // activities produced by an older encoder that did not carry it — those
+    // cannot re-seal to a matching id and will be rejected, which is correct.
+    const nodeAuthor = typeof diffTag["ad4m:author"] === "string" && diffTag["ad4m:author"]
+        ? diffTag["ad4m:author"]
+        : `ap:${activity.actor}`;
 
     return {
         id: String(diffTag["ad4m:diffId"] || ""),
         prev: Array.isArray(diffTag["ad4m:prev"]) ? diffTag["ad4m:prev"].map(String) : [],
         removals: Array.isArray(diffTag["ad4m:removals"]) ? diffTag["ad4m:removals"].map(String) : [],
         additions,
-        author,
+        author: nodeAuthor,
     };
 }
 

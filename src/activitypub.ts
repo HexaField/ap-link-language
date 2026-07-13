@@ -36,6 +36,8 @@ export const AD4M_CONTEXT_ENTRY = {
     "ad4m:prev": "ad4m:prev",
     "ad4m:additions": "ad4m:additions",
     "ad4m:removals": "ad4m:removals",
+    "ad4m:author": "ad4m:author",
+    "ad4m:timestamp": "ad4m:timestamp",
 };
 
 export function apContext(): (string | Record<string, unknown>)[] {
@@ -81,6 +83,15 @@ export interface APDiffTag extends APTag {
     "ad4m:diffId": string;
     "ad4m:prev": string[];
     "ad4m:removals": string[];
+    /**
+     * The committing agent's DID — the DAG node's `author`. This is part of the
+     * node's CONTENT HASH (see dag.canonicalDiff), so it MUST round-trip: a
+     * receiver re-seals the decoded node and rejects it if the recomputed id
+     * disagrees with `ad4m:diffId`. Reconstructing the author from the AP actor
+     * URL instead of the original DID would change the hash and drop every peer
+     * node. Optional for backward-compatible decode of older activities.
+     */
+    "ad4m:author"?: string;
 }
 
 export interface APObject {

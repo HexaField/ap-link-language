@@ -104,13 +104,22 @@ function followerInboxes(): string[] {
 }
 
 /**
- * Deliver one already-built AP activity to followers, falling back to a
- * federation-service signal when we have no cached follower inboxes yet.
+ * Deliver one already-built AP activity to the neighbourhood.
+ *
+ * Group-actor fan-out: every diff is POSTed to the neighbourhood's GROUP inbox,
+ * which republishes it to the shared group outbox for all members to pull — the
+ * real Fediverse group pattern (Lemmy/Guppe/Mobilizon members POST to the group
+ * inbox and the group re-announces). Direct follower inboxes are additive (a peer
+ * that follows us gets a copy immediately). With no delivery targets at all we
+ * fall back to a federation-service signal.
  */
 async function federateActivity(activity: APActivity): Promise<void> {
-    const inboxes = followerInboxes();
-    if (inboxes.length > 0) {
-        await deliverToFollowers(activity, inboxes, actorKeyId, GROUP_ACTOR_URL);
+    const targets = new Set<string>();
+    if (GROUP_INBOX_URL && !GROUP_INBOX_URL.startsWith("<")) targets.add(GROUP_INBOX_URL);
+    for (const inbox of followerInboxes()) targets.add(inbox);
+
+    if (targets.size > 0) {
+        await deliverToFollowers(activity, [...targets], actorKeyId, GROUP_ACTOR_URL);
     } else {
         emitDeliveryRequest(activity, GROUP_ACTOR_URL);
     }
@@ -429,6 +438,15 @@ const language = defineLanguage({
                 neighbourhoodUrl(),
                 GROUP_ACTOR_URL,
             );
+
+            // The executor DISCARDS sync()'s return value — an inbound peer fold
+            // only becomes queryable when pushed through emitPerspectiveDiff (the
+            // same host channel commit() uses). Without this, peers' diff-DAG nodes
+            // are ingested and folded into the cache but never surface through
+            // queryLinks. (Same trap as nostr/hypercore/solid/atproto.)
+            if (dagDelta.additions.length > 0 || dagDelta.removals.length > 0) {
+                emitPerspectiveDiff(dagDelta);
+            }
 
             // ROLE B (inbound) — ingest genuinely native-authored Notes (from
             // pure Fediverse actors with NO AD4M DID) as NEW authoritative links

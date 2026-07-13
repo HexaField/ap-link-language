@@ -253,7 +253,11 @@ NODE_ENV=development pnpm run test
   revision (deterministic + stable across restart), DAG-fold reproduces the link
   set, removal convergence carrying the original hash (incl. the `ap://deleted`
   regression, add-after-remove, and concurrent add/remove OR-Set cases), and
-  order-independent merge across every ingestion permutation.
+  order-independent merge across every ingestion permutation. **§5.5** federates
+  two replicas through the *real* `diffNodeToActivity → activityToDiffNode`
+  encoding (not a raw byte copy), with the AP actor URL deliberately unrelated to
+  the committing DID — the direct guard for the co-located C1 partition where the
+  node author failed to round-trip and every peer node was dropped on re-seal.
 - **`tests/translate.test.ts`** — link ↔ AP activity translation, diff-DAG
   activity encode/decode, rendering strategies, and the external-note removal
   round-trip (removal is triple-identical to the add it cancels).
@@ -275,16 +279,43 @@ NODE_ENV=development pnpm run test
   Follow/Accept/Undo, inbox routing, membership/rate-limiting/blocks, SDNA
   pattern detection, and federation echo-loop dedup.
 
-### What is (and is not) covered without live federation
+### Verified live against a real group actor (co-located C1)
 
-The DAG algebra is fully unit-tested: walk, fold, OR-Set merge, revision
-determinism, restart stability, and removal convergence are exercised against
-in-memory fixtures, modelling two replicas as two storages that exchange sealed
-diff nodes. What still needs a **live multi-instance federation harness** (two
-real AD4M executors + AP servers) is the end-to-end wire path: HTTP-signed
-delivery to real inboxes, actor/webfinger resolution against live servers, and
-prev-walk re-fetching parent activities over the network. Those paths are
-covered by mock-adapter tests here but not against live peers.
+The AD4M wind-tunnel C1 scenario runs this language end-to-end against a **live
+ActivityPub group actor** (a dependency-free AS2 outbox-reflecting server that
+stands in for a Lemmy/Guppe-style group): two executors each write 10 links, then
+each removes one, and the harness proves convergence via each executor's own
+`queryLinks`. **Both agents reached 20/20 links in 1.05 s and a removal converged
+in 3.05 s.** The group's outbox held 21 diff activities (20 adds + 1 removal),
+each an `ad4m:Diff`-tagged `Create{Note}` folded identically on both replicas.
+This exercises, for real, what the unit suite can only mock:
+
+- **Outbox fan-out** — each agent POSTs its diff activities to the group inbox;
+  the group reflects them into its outbox; both agents pull via `syncFromOutbox`
+  and fold the emulated `prev` DAG.
+- **AP-encoded federation** — every node crosses the full
+  `diffNodeToActivity → activityToDiffNode → sealDiff` path, so the content hash
+  (including the committing DID) must survive the JSON-LD round-trip.
+
+The live run surfaced two defects the fixtures could not: the executor **discards
+`sync()`'s return value** (peer folds must be pushed through `emitPerspectiveDiff`,
+now trapped after `syncFromOutbox`), and the **DAG node author was not
+round-tripped** through the `ad4m:Diff` tag — the receiver reconstructed it from
+the AP actor URL, changing the content hash so every peer node was silently
+rejected on re-seal (the A=10/B=10 partition). Both are regression-guarded
+(`tests/dag.test.ts` §5.5) and documented in `AGENTS.md`.
+
+### What still needs distinct-instance federation
+
+The C1 model is **co-located** — both executors share one group actor on the same
+host, so the wire path is exercised but not across a trust/network boundary. Still
+only mock-adapter-tested, not run end-to-end against live remote peers:
+
+- HTTP-signed delivery to a **remote** inbox with signature *verification* on the
+  receiver (the co-located group accepts signatures without verifying them).
+- Actor/WebFinger resolution against a real Mastodon/Pleroma/Lemmy instance.
+- Prev-walk **re-fetching** a missing parent activity over the network (co-located,
+  every parent already rides in the same outbox pull, so no gap-fill fetch fires).
 
 ## `ad4m:host` import boundary
 
